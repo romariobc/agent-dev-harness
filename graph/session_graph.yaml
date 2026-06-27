@@ -1,0 +1,286 @@
+# session_graph.yaml
+#
+# Especificação formal do grafo de estados do agente de desenvolvimento.
+# Define os 6 nós, transições, timeouts, e interrupt signals para rastreamento
+# previsível no LangSmith e integração com o Nerve Layer event bus.
+#
+# Fluxo: init → load_context → load_skill → execute → verify → persist → END
+
+nodes:
+  # -----------------------------------------------------------------------
+  # Nó 1: INIT
+  # -----------------------------------------------------------------------
+  - id: init
+    name: "Initialize Session"
+    description: |
+      Carrega Project Brief, verifica versão, roda baseline de testes.
+      Valida que o ambiente está pronto (project-studio contactável,
+      nerve-layer eventos acessíveis).
+    timeout_ms: 30000
+    max_retries: 2
+    retry_backoff_ms: 1000
+    on_success: load_context
+    on_failure: abort
+    actions:
+      - name: "load_brief"
+        type: "deterministic"
+        description: "Lê PROJECT_SPEC.md + BUSINESS.md, valida schema"
+      - name: "verify_version"
+        type: "deterministic"
+        description: "Verifica brief_version contra .brief_manifest.json"
+      - name: "baseline_test"
+        type: "deterministic"
+        description: "Executa pytest -q para detectar regressões"
+    outputs:
+      - brief_version
+      - baseline_pass
+
+  # -----------------------------------------------------------------------
+  # Nó 2: LOAD_CONTEXT
+  # -----------------------------------------------------------------------
+  - id: load_context
+    name: "Load Project Context"
+    description: |
+      Carrega contexto governado: AGENTS.md, GUARDRAILS.md, PLAYBOOK.md,
+      decisions/ (ADRs aprovados), deprecated_terms via SKILL.md.
+      Monta o objeto de contexto que será passado ao LLM.
+    timeout_ms: 15000
+    max_retries: 1
+    retry_backoff_ms: 500
+    on_success: load_skill
+    on_failure: abort
+    actions:
+      - name: "load_agents"
+        type: "deterministic"
+        description: "Lê AGENTS.md, extrai prompts dos agentes"
+      - name: "load_guardrails"
+        type: "deterministic"
+        description: "Lê GUARDRAILS.md, extrai proibições e risk zones"
+      - name: "load_decisions"
+        type: "deterministic"
+        description: "Scans decisions/, valida ADRs (não-stale, aprovados)"
+      - name: "load_playbook"
+        type: "deterministic"
+        description: "Lê PLAYBOOK.md, extrai fluxos críticos"
+    outputs:
+      - context_id
+      - guardrails_count
+      - decisions_loaded
+
+  # -----------------------------------------------------------------------
+  # Nó 3: LOAD_SKILL
+  # -----------------------------------------------------------------------
+  - id: load_skill
+    name: "Load Domain Skill (Optional)"
+    description: |
+      Carrega skill do domínio ativo (se aplicável).
+      Extrai vocabulário, deprecated_terms, fluxos específicos do domínio.
+      FALHA AQUI NÃO BLOQUEIA — skill ausente = proceed com contexto
+      genérico (graceful degradation).
+    timeout_ms: 10000
+    max_retries: 0
+    on_success: execute
+    on_failure: execute
+    actions:
+      - name: "find_active_domain"
+        type: "deterministic"
+        description: "Detecta domínio ativo via AGENTS.md ou user input"
+      - name: "load_skill_file"
+        type: "deterministic"
+        description: "Lê SKILL.md do domínio, extrai vocabulário"
+      - name: "validate_skill_version"
+        type: "deterministic"
+        description: "Compara skill_version com .brief_manifest.json"
+    outputs:
+      - skill_id
+      - skill_version
+      - vocabulary
+      - skill_loaded  # false se skill não encontrado
+
+  # -----------------------------------------------------------------------
+  # Nó 4: EXECUTE
+  # -----------------------------------------------------------------------
+  - id: execute
+    name: "Execute Feature"
+    description: |
+      Executa o trabalho atual: copiar template, gerar boilerplate,
+      chamar LLM com prompt governado, etc.
+      Timeout longo (5min) porque LLM é envolvido.
+      Emite harness.task.executing evento ao Nerve.
+    timeout_ms: 300000
+    max_retries: 2
+    retry_backoff_ms: 2000
+    on_success: verify
+    on_failure: persist
+    actions:
+      - name: "emit_task_executing"
+        type: "event"
+        description: "Emite harness.task.executing no Nerve Layer"
+        event_name: "harness.task.executing"
+      - name: "run_llm_or_template"
+        type: "llm"
+        description: "Chama LLM com context + prompt ou executa template"
+      - name: "validate_output"
+        type: "deterministic"
+        description: "Verifica que output não viola GUARDRAILS.md"
+    outputs:
+      - output_files
+      - execution_time_ms
+      - validation_pass
+
+  # -----------------------------------------------------------------------
+  # Nó 5: VERIFY
+  # -----------------------------------------------------------------------
+  - id: verify
+    name: "Verify & Validate"
+    description: |
+      Verificação em duas camadas:
+      1. Computacional: pytest, lint, type check (determinístico, rápido)
+      2. Inferencial: LLM-as-judge para qualidade semântica
+      Não bloqueia se falhar — resultado é armazenado para humano decidir.
+    timeout_ms: 60000
+    max_retries: 0
+    on_success: persist
+    on_failure: persist
+    actions:
+      - name: "run_pytest"
+        type: "deterministic"
+        description: "pytest -q tests/ com timeout 20s"
+      - name: "run_lint"
+        type: "deterministic"
+        description: "ruff check / pylint / eslint com timeout 10s"
+      - name: "run_type_check"
+        type: "deterministic"
+        description: "mypy / pyright com timeout 10s"
+      - name: "llm_quality_judge"
+        type: "llm"
+        description: "LLM avalia: segue style guide? Atende Brief? Sem bugs óbvios?"
+    outputs:
+      - tests_pass
+      - lint_pass
+      - type_check_pass
+      - llm_quality_score
+
+  # -----------------------------------------------------------------------
+  # Nó 6: PERSIST
+  # -----------------------------------------------------------------------
+  - id: persist
+    name: "Persist & Emit Event"
+    description: |
+      Atualiza logs, persiste estado, emite evento final ao Nerve.
+      Sempre bem-sucedido (final node antes de END).
+      Emite harness.task.complete ou harness.task.blocked baseado em
+      verify results.
+    timeout_ms: 5000
+    max_retries: 1
+    retry_backoff_ms: 500
+    on_success: END
+    on_failure: END
+    actions:
+      - name: "append_sessions_log"
+        type: "deterministic"
+        description: "Append entry to sessions.log com resultado da execução"
+      - name: "decide_completion_status"
+        type: "deterministic"
+        description: "Decide: complete (todos pass) vs blocked (qualquer fail)"
+      - name: "emit_completion_event"
+        type: "event"
+        description: "Emite harness.task.complete ou harness.task.blocked"
+        event_names:
+          - "harness.task.complete"
+          - "harness.task.blocked"
+    outputs:
+      - final_status  # complete | blocked
+      - session_id
+
+# =========================================================================
+# INTERRUPT SIGNALS
+# =========================================================================
+# Eventos que podem interromper ou sinalizar durante execução.
+# interrupt_current=true para de uma vez, =false continua mas flags o evento.
+
+interrupt_signals:
+  - event_name: brief.published
+    source: project-studio
+    description: |
+      Project Brief foi publicado (versão nova). Sinaliza que contexto
+      pode ter mudado — agenda recarregamento de load_context no próximo
+      ciclo. Não interrompe execução atual.
+    interrupt_current: false
+    action_on_interrupt: "flag_context_stale"
+    priority: HIGH
+
+  - event_name: adr.approved
+    source: project-studio
+    description: |
+      ADR foi aprovado. Sincroniza decision index sem interromper.
+      Próximo load_context verá a nova decisão.
+    interrupt_current: false
+    action_on_interrupt: "sync_decisions_index"
+    priority: MEDIUM
+
+  - event_name: adr.stale
+    source: project-studio
+    description: |
+      ADR ficou stale (draft > 72h). Alerta para revisão, não interrompe.
+    interrupt_current: false
+    action_on_interrupt: "log_stale_adr_alert"
+    priority: LOW
+
+  - event_name: design.component.changed
+    source: project-studio
+    description: |
+      Design System component foi atualizado. Alerta desenvolvedor mas
+      não interrompe — decisão humana se precisa replan.
+    interrupt_current: false
+    action_on_interrupt: "log_design_change_alert"
+    priority: LOW
+
+  - event_name: skill.updated
+    source: project-studio
+    description: |
+      Skill do domínio foi atualizado (nova versão, deprecated_terms).
+      Se em load_skill ou execute, flag para recarregar no próximo ciclo.
+    interrupt_current: false
+    action_on_interrupt: "flag_skill_stale"
+    priority: MEDIUM
+
+# =========================================================================
+# FAILURE MODES & RECOVERY
+# =========================================================================
+
+failure_recovery:
+  - node: init
+    error: "brief_version_mismatch"
+    recovery: "abort (contexto corrupto, não procede)"
+    event: "harness.init.failed"
+
+  - node: load_context
+    error: "missing_guardrails"
+    recovery: "abort (governança incompleta)"
+    event: "harness.context.incomplete"
+
+  - node: load_skill
+    error: "skill_not_found"
+    recovery: "continue (graceful degradation, skill optional)"
+    event: "harness.skill.missing"
+
+  - node: execute
+    error: "llm_timeout"
+    recovery: "retry 2x, then persist with error"
+    event: "harness.execute.timeout"
+
+  - node: verify
+    error: "pytest_failure"
+    recovery: "continue to persist (não bloqueia, human decides)"
+    event: "harness.verify.failed"
+
+# =========================================================================
+# METADATA
+# =========================================================================
+
+version: "1.0.0"
+created_at: "2026-06-27"
+last_updated: "2026-06-27"
+description: "LangGraph session orchestration for Project Nerve agent"
+langsmith_trace_prefix: "nerve-session"
